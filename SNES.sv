@@ -16,7 +16,7 @@
 //  You should have received a copy of the GNU General Public License along
 //  with this program; if not, write to the Free Software Foundation, Inc.,
 //  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-//============================================================================ 
+//=============================================f=============================== 
 
 module emu
 (
@@ -297,7 +297,7 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | spc_download | bk_
 
 `include "build_id.v"
 parameter CONF_STR = {
-	"SNES;SS3F800000:100000,UART31250,MIDI;",
+	"SNES;SS3F800000:100000,UART115200,MIDI;",
 	"FS1,SFCSMCBINBS ;",
 	"FS4,SPC;",
 	"-;",
@@ -404,6 +404,8 @@ wire [15:0] joystick1_rumble;
 
 wire  [7:0] joy0_x,joy0_y,joy1_x,joy1_y;
 
+reg  [7:0] uart_mode;
+
 wire [64:0] RTC;
 
 wire [21:0] gamma_bus;
@@ -454,6 +456,8 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
+    
+    .uart_mode(uart_mode),
 
 	.RTC(RTC),
 
@@ -837,6 +841,11 @@ wire       WRAM_OE_N;
 wire       WRAM_WE_N;
 wire [7:0] WRAM_Q, WRAM_D;
 
+wire[16:0] WRAM_SNI_ADDR;
+wire[7:0]  WRAM_SNI_DATA;
+wire	   WRAM_SNI_WREN;
+reg        WRAM_SNI_BUSY;
+
 wire[24:0] cart_addr_download = ioctl_addr-10'd512;
 wire[23:0] ssbin_addr_download = { 8'hFF, ioctl_addr[15:0] };
 wire[23:0] addr_download = ssbin_download ? ssbin_addr_download : cart_addr_download[23:0];
@@ -844,8 +853,18 @@ wire[23:0] addr_download = ssbin_download ? ssbin_addr_download : cart_addr_down
 wire       sdram_download = cart_download | ssbin_download;
 
 reg READ_PULSE;
-always @(posedge clk_sys)
+always @(posedge clk_sys) begin
 	READ_PULSE <= SNES_SYSCLKR_CE;
+    if (~WRAM_CE_N) begin
+        WRAM_SNI_BUSY <= 0;
+    end else if (WRAM_SNI_WREN) begin
+        if (SNES_SYSCLKF_CE) WRAM_SNI_BUSY <= 1;
+        if (SNES_SYSCLKR_CE) WRAM_SNI_BUSY <= 0;
+    end else begin
+        if (SNES_SYSCLKF_CE) WRAM_SNI_BUSY <= 0;
+        if (SNES_SYSCLKR_CE) WRAM_SNI_BUSY <= 1;
+    end
+end
 
 wire [15:0] sdr_dout1;
 sdram sdram
@@ -872,12 +891,14 @@ sdram sdram
 	.wr0(sdram_download ? ioctl_wr : ~ROM_WE_N),
 	.word0(sdram_download | ROM_WORD),
 	
-	.addr1(clearing_ram ? {7'b0000000,mem_fill_addr} : {7'b0000000,WRAM_ADDR}),
-	.din1(clearing_ram ? {8'h00,wram_fill_data} : {8'h00,WRAM_D}),
+	.addr1(clearing_ram ? {7'b0000000,mem_fill_addr} : {7'b0000000,~WRAM_CE_N ? WRAM_ADDR: WRAM_SNI_ADDR}),
+	.din1(clearing_ram ? {8'h00,wram_fill_data} : {8'h00,~WRAM_CE_N ? WRAM_D : WRAM_SNI_DATA}),
 	.dout1(sdr_dout1),
-	.rd1(clearing_ram ? 1'b0 : ~WRAM_CE_N & ~WRAM_OE_N & READ_PULSE),
-	.wr1(clearing_ram ? mem_fill_we : ~WRAM_CE_N & ~WRAM_WE_N & SNES_SYSCLKF_CE),
+
+	.rd1(clearing_ram ? 1'b0 : (~WRAM_CE_N ? ~WRAM_OE_N : ~WRAM_SNI_WREN) & READ_PULSE),
+	.wr1(clearing_ram ? mem_fill_we : (~WRAM_CE_N ? ~WRAM_WE_N : WRAM_SNI_WREN) & SNES_SYSCLKF_CE),
 	.rfs1(clearing_ram ? 1'b0 : SNES_REFRESH),
+
 	.word1(0)
 );
 
@@ -1032,18 +1053,65 @@ video_mixer #(.LINE_LENGTH(520), .GAMMA(1)) video_mixer
 ////////////////////////////  I/O PORTS  ////////////////////////////////
 
 assign {UART_RTS, UART_DTR} = 1;
-wire [15:0] uart_data;
+
+wire piano = status[43] & (uart_mode == 3);
+reg last_piano = 1'b0;
+always @(posedge clk_sys) last_piano <= piano;
+reg piano_tdata_i;
+reg sni_tdata_i;
+wire [15:0] piano_data_i;
+wire [15:0] sni_data_i;
+wire [15:0] data_o;
+wire rbf;
+wire txint;
+wire rxint;
+
+uart uart(
+    .clk(clk_sys),
+    .reset(reset || (piano ^ last_piano)),
+    .midi_speed_sel(piano),
+    .tdata_i(piano ? piano_tdata_i : sni_tdata_i),
+    .data_i(piano ? piano_data_i : sni_data_i),
+    .data_o(data_o),
+	.uartbrk(1'b0),//reset),
+	.rbfmirror(rbf),
+    .txint(txint),
+    .rxint(rxint),
+    .txd(UART_TXD),
+    .rxd(UART_RXD)
+);
+
 wire piano_joypad_do;
-wire piano = status[43];
 miraclepiano miracle(
 	.clk(clk_sys),
 	.reset(reset || !piano),
 	.strobe(JOY_STRB),
 	.joypad_o(piano_joypad_do),
 	.joypad_clock(JOY1_CLK),
-	.data_o(uart_data),
-	.txd(UART_TXD),
-	.rxd(UART_RXD)
+    .txint(txint),
+    .rxint(rxint),
+    .tdata_i(piano_tdata_i),
+    .tdata_m(piano_data_i),
+    .rdata_m(data_o)
+);
+
+sni sni(
+	.clk(clk_sys),
+	.reset(reset || uart_mode != 6),
+    .vblank(VBlank),
+	
+	.wram_addr(WRAM_SNI_ADDR),
+	.wram_data(WRAM_SNI_DATA),
+	.wram_q(WRAM_Q),
+	.wram_wren(WRAM_SNI_WREN),
+    .wram_busy(WRAM_SNI_BUSY),
+	
+	.rbf(rbf),
+	.txint(txint),
+	.rxint(rxint),
+	.tdata_i(sni_tdata_i),
+	.tdata_m(sni_data_i),
+	.rdata_m(data_o)
 );
 wire [1:0] JOY1_DO = piano ? {1'b1,piano_joypad_do} : JOY1_DO_t;
 
